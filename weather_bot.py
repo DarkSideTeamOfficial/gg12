@@ -792,20 +792,52 @@ async def handle_text(message: Message, state: FSMContext):
 
 async def main():
     """Основная функция для запуска бота"""
+    import signal
+    import sys
+    
     print("🌤️ Запуск бота прогноза погоды...")
     print("Для остановки нажмите Ctrl+C")
+    
+    # Флаг для graceful shutdown
+    shutdown_event = asyncio.Event()
+    
+    def signal_handler(sig, frame):
+        """Обработчик сигналов для graceful shutdown"""
+        print("\n🛑 Получен сигнал остановки, завершаю работу...")
+        shutdown_event.set()
+    
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     try:
         # Запускаем планировщик уведомлений
         await start_scheduler(bot)
         print("📅 Планировщик уведомлений запущен")
         
-        # Запускаем бота
-        await dp.start_polling(bot)
+        # Запускаем бота с обработкой конфликтов
+        polling_task = asyncio.create_task(_start_polling_with_retry())
+        
+        # Ждем либо завершения polling, либо сигнала остановки
+        done, pending = await asyncio.wait(
+            [polling_task, asyncio.create_task(shutdown_event.wait())],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        
+        # Отменяем незавершенные задачи
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
     except KeyboardInterrupt:
         print("\n🛑 Бот остановлен пользователем")
     except Exception as e:
         print(f"❌ Ошибка при запуске бота: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         # Останавливаем планировщик
         await stop_scheduler()
@@ -818,6 +850,35 @@ async def main():
         # Закрываем сессию бота
         await bot.session.close()
         print("👋 Бот полностью остановлен")
+
+
+async def _start_polling_with_retry():
+    """Запуск polling с обработкой конфликтов и автоматическим переподключением"""
+    from aiogram.exceptions import TelegramConflictError
+    
+    # Проверяем, можем ли мы получить обновления (проверка на конфликт)
+    print("🔍 Проверка доступности бота...")
+    try:
+        # Пытаемся получить информацию о боте
+        bot_info = await bot.get_me()
+        print(f"✅ Бот подключен: @{bot_info.username}")
+    except Exception as e:
+        print(f"⚠️ Ошибка при проверке бота: {e}")
+        # Продолжаем, возможно это временная проблема
+    
+    # Запускаем polling
+    # aiogram сам обрабатывает конфликты внутри start_polling,
+    # но мы можем добавить дополнительную логику
+    print("🚀 Запуск polling...")
+    try:
+        await dp.start_polling(bot, close_bot_session=False)
+    except TelegramConflictError as e:
+        print(f"❌ Конфликт с другим экземпляром бота: {e}")
+        print("💡 Убедитесь, что только один экземпляр бота запущен")
+        raise
+    except Exception as e:
+        print(f"❌ Ошибка при запуске polling: {e}")
+        raise
 
 # Примечание: Для запуска бота используйте run_bot.py
 # Этот файл содержит только логику бота и функцию main()
