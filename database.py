@@ -5,7 +5,7 @@
 """
 
 import psycopg
-from psycopg import pool
+from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 import json
 import os
@@ -29,7 +29,7 @@ class UserDatabase:
         
         # Создаем пул соединений для лучшей производительности
         try:
-            self.connection_pool = pool.ConnectionPool(
+            self.connection_pool = ConnectionPool(
                 self.database_url,
                 min_size=1,
                 max_size=10,
