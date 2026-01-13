@@ -11,7 +11,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from database import db
 from scheduler import start_scheduler, stop_scheduler, send_test_notification
-from weather_functions import get_weather, get_detailed_weather, get_weather_json
+from weather_functions import get_weather, get_detailed_weather, get_weather_json, get_weather_data_dict
+from ai_recommendations import get_weather_recommendations_async
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -26,30 +27,66 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Вспомогательная функция для отправки AI рекомендаций
+async def _send_ai_recommendations(chat_id: int, city: str):
+    """Отправка AI рекомендаций отдельным сообщением (не блокирует основной ответ)"""
+    try:
+        weather_data = get_weather_data_dict(city)
+        if weather_data:
+            recommendations = await get_weather_recommendations_async(weather_data)
+            if recommendations:
+                await bot.send_message(
+                    chat_id,
+                    f"💡 *Рекомендации:*\n\n{recommendations}",
+                    parse_mode="Markdown"
+                )
+    except Exception as e:
+        logging.error(f"Ошибка при получении AI рекомендаций: {e}")
+        # Не показываем ошибку пользователю, просто не отправляем рекомендации
+
 # Состояния для FSM
 class WeatherSettings(StatesGroup):
     waiting_for_city = State()
     waiting_for_morning_time = State()
     waiting_for_evening_time = State()
+    waiting_for_forecast_city = State()  # Для запроса города для подробного прогноза
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     """Обработчик команды /start"""
+    user_id = message.from_user.id
+    
+    # Проверяем, есть ли у пользователя сохраненный город
+    user_data = db.get_user(user_id)
+    has_city = user_data and user_data.get('city')
+    
     welcome_text = """
 🌤️ Добро пожаловать в бота прогноза погоды!
 
-Доступные команды:
-/weather <город> - краткий прогноз погоды
-/forecast <город> - подробный прогноз погоды
-/help - помощь
-
-Примеры:
-/weather Москва
-/forecast Санкт-Петербург
-/weather London
+Выберите действие:
 """
-    await message.answer(welcome_text)
+    
+    # Создаем клавиатуру с кнопками
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🌤️ Моя погода (кратко)", callback_data="my_weather_brief"),
+            InlineKeyboardButton(text="📊 Моя погода (подробно)", callback_data="my_weather_detailed")
+        ],
+        [
+            InlineKeyboardButton(text="🔍 Погода в городе", callback_data="weather_city"),
+            InlineKeyboardButton(text="📈 Подробный прогноз", callback_data="forecast_city")
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings_menu"),
+            InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help_info")
+        ]
+    ])
+    
+    if not has_city:
+        welcome_text += "\n💡 Совет: Настройте город в настройках для быстрого доступа к погоде!"
+    
+    await message.answer(welcome_text, reply_markup=keyboard)
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -102,6 +139,9 @@ async def cmd_weather(message: Message):
         # Получаем данные о погоде (используем JSON формат для надежности)
         weather_info = get_weather_json(city)
         await message.answer(weather_info, parse_mode="Markdown")
+        
+        # Отправляем AI рекомендации отдельным сообщением
+        asyncio.create_task(_send_ai_recommendations(message.chat.id, city))
     except Exception as e:
         await message.answer(f"❌ Произошла ошибка при получении погоды: {str(e)}")
 
@@ -126,6 +166,9 @@ async def cmd_forecast(message: Message):
         # Получаем подробные данные о погоде
         weather_info = get_detailed_weather(city)
         await message.answer(weather_info, parse_mode="Markdown")
+        
+        # Отправляем AI рекомендации отдельным сообщением
+        asyncio.create_task(_send_ai_recommendations(message.chat.id, city))
     except Exception as e:
         await message.answer(f"❌ Произошла ошибка при получении прогноза: {str(e)}")
 
@@ -212,7 +255,13 @@ async def cmd_my_weather(message: Message):
     user_data = db.get_user(user_id)
     
     if not user_data or not user_data.get('city'):
-        await message.answer("❌ Город не установлен. Используйте /subscribe для настройки.")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настроить город", callback_data="settings_menu")]
+        ])
+        await message.answer(
+            "❌ Город не установлен. Используйте /subscribe для настройки.",
+            reply_markup=keyboard
+        )
         return
     
     city = user_data['city']
@@ -228,6 +277,9 @@ async def cmd_my_weather(message: Message):
         weather_info = get_weather_json(city)
     
     await message.answer(weather_info, parse_mode="Markdown")
+    
+    # Отправляем AI рекомендации отдельным сообщением
+    asyncio.create_task(_send_ai_recommendations(message.chat.id, city))
 
 @dp.message(Command("test_notification"))
 async def cmd_test_notification(message: Message):
@@ -342,10 +394,226 @@ async def callback_back_to_settings(callback: CallbackQuery):
     await callback.message.edit_text(settings_text, reply_markup=keyboard)
     await callback.answer()
 
+# Новые обработчики для Inline кнопок главного меню
+@dp.callback_query(F.data == "my_weather_brief")
+async def callback_my_weather_brief(callback: CallbackQuery):
+    """Обработчик кнопки 'Моя погода (кратко)'"""
+    user_id = callback.from_user.id
+    user_data = db.get_user(user_id)
+    
+    if not user_data or not user_data.get('city'):
+        await callback.answer("❌ Город не настроен. Используйте /subscribe", show_alert=True)
+        return
+    
+    city = user_data['city']
+    await callback.answer("⏳ Получаю погоду...")
+    
+    await bot.send_chat_action(callback.message.chat.id, "typing")
+    weather_info = get_weather_json(city)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Подробный прогноз", callback_data="my_weather_detailed")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+    ])
+    
+    await callback.message.answer(weather_info, parse_mode="Markdown", reply_markup=keyboard)
+    
+    # Отправляем AI рекомендации отдельным сообщением
+    asyncio.create_task(_send_ai_recommendations(callback.message.chat.id, city))
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "my_weather_detailed")
+async def callback_my_weather_detailed(callback: CallbackQuery):
+    """Обработчик кнопки 'Моя погода (подробно)'"""
+    user_id = callback.from_user.id
+    user_data = db.get_user(user_id)
+    
+    if not user_data or not user_data.get('city'):
+        await callback.answer("❌ Город не настроен. Используйте /subscribe", show_alert=True)
+        return
+    
+    city = user_data['city']
+    await callback.answer("⏳ Получаю подробный прогноз...")
+    
+    await bot.send_chat_action(callback.message.chat.id, "typing")
+    weather_info = get_detailed_weather(city)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌤️ Краткий прогноз", callback_data="my_weather_brief")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+    ])
+    
+    # Отправляем погоду сразу
+    await callback.message.answer(weather_info, parse_mode="Markdown", reply_markup=keyboard)
+    
+    # Получаем и отправляем рекомендации отдельным сообщением (асинхронно, без блокировки)
+    asyncio.create_task(_send_ai_recommendations(callback.message.chat.id, city))
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "weather_city")
+async def callback_weather_city(callback: CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Погода в городе'"""
+    await callback.message.edit_text("🏙️ Введите название города для получения краткого прогноза погоды:")
+    await state.set_state(WeatherSettings.waiting_for_city)
+    await callback.answer()
+
+@dp.callback_query(F.data == "forecast_city")
+async def callback_forecast_city(callback: CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Подробный прогноз'"""
+    await callback.message.edit_text("🏙️ Введите название города для получения подробного прогноза погоды:")
+    await state.set_state(WeatherSettings.waiting_for_forecast_city)
+    await callback.answer()
+
+@dp.callback_query(F.data == "settings_menu")
+async def callback_settings_menu(callback: CallbackQuery):
+    """Обработчик кнопки 'Настройки'"""
+    user_id = callback.from_user.id
+    user_data = db.get_user(user_id)
+    
+    if not user_data or not user_data.get('city'):
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏙️ Настроить город", callback_data="change_city")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+        ])
+        await callback.message.edit_text(
+            "⚙️ Настройки\n\n❌ Город не установлен. Настройте город для автоматических уведомлений.",
+            reply_markup=keyboard
+        )
+    else:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏙️ Изменить город", callback_data="change_city")],
+            [InlineKeyboardButton(text="⏰ Настроить время", callback_data="change_time")],
+            [InlineKeyboardButton(text="📊 Тип прогноза", callback_data="change_type")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+        ])
+        
+        settings_text = f"""
+⚙️ Настройки автоматической отправки погоды
+
+🏙️ Город: {user_data['city']}
+⏰ Утреннее время: {user_data.get('morning_time', '08:00')}
+🌙 Вечернее время: {user_data.get('evening_time', '20:00')}
+📊 Тип прогноза: {'Подробный' if user_data.get('weather_type') == 'detailed' else 'Краткий'}
+
+Выберите, что хотите изменить:
+"""
+        await callback.message.edit_text(settings_text, reply_markup=keyboard)
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "help_info")
+async def callback_help_info(callback: CallbackQuery):
+    """Обработчик кнопки 'Помощь'"""
+    help_text = """
+ℹ️ Помощь по использованию бота
+
+🌤️ Моя погода - получить погоду для вашего города (из настроек)
+🔍 Погода в городе - получить краткий прогноз для любого города
+📈 Подробный прогноз - получить детальный прогноз на 3 дня
+
+⚙️ Настройки - настроить автоматические уведомления
+
+Команды:
+/start - главное меню
+/subscribe - настроить подписку
+/settings - посмотреть настройки
+/help - эта справка
+"""
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+    ])
+    
+    await callback.message.edit_text(help_text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data == "main_menu")
+async def callback_main_menu(callback: CallbackQuery):
+    """Обработчик кнопки 'Главное меню'"""
+    user_id = callback.from_user.id
+    user_data = db.get_user(user_id)
+    has_city = user_data and user_data.get('city')
+    
+    welcome_text = "🏠 Главное меню:\n\nВыберите действие:"
+    if not has_city:
+        welcome_text += "\n💡 Совет: Настройте город в настройках для быстрого доступа к погоде!"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🌤️ Моя погода (кратко)", callback_data="my_weather_brief"),
+            InlineKeyboardButton(text="📊 Моя погода (подробно)", callback_data="my_weather_detailed")
+        ],
+        [
+            InlineKeyboardButton(text="🔍 Погода в городе", callback_data="weather_city"),
+            InlineKeyboardButton(text="📈 Подробный прогноз", callback_data="forecast_city")
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings_menu"),
+            InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help_info")
+        ]
+    ])
+    
+    await callback.message.edit_text(welcome_text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("forecast_"))
+async def callback_forecast_by_city(callback: CallbackQuery):
+    """Обработчик подробного прогноза для конкретного города"""
+    city = callback.data.replace("forecast_", "")
+    
+    if city == "city":
+        # Если это запрос на ввод города, обработается через FSM
+        return
+    
+    await callback.answer("⏳ Получаю подробный прогноз...")
+    await bot.send_chat_action(callback.message.chat.id, "typing")
+    
+    weather_info = get_detailed_weather(city)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌤️ Краткий прогноз", callback_data=f"weather_{city}")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+    ])
+    
+    await callback.message.answer(weather_info, parse_mode="Markdown", reply_markup=keyboard)
+    
+    # Отправляем AI рекомендации отдельным сообщением
+    asyncio.create_task(_send_ai_recommendations(callback.message.chat.id, city))
+    
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("weather_"))
+async def callback_weather_by_city(callback: CallbackQuery):
+    """Обработчик краткого прогноза для конкретного города"""
+    city = callback.data.replace("weather_", "")
+    
+    if city == "city":
+        # Если это запрос на ввод города, обработается через FSM
+        return
+    
+    await callback.answer("⏳ Получаю погоду...")
+    await bot.send_chat_action(callback.message.chat.id, "typing")
+    
+    weather_info = get_weather_json(city)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Подробный прогноз", callback_data=f"forecast_{city}")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+    ])
+    
+    await callback.message.answer(weather_info, parse_mode="Markdown", reply_markup=keyboard)
+    
+    # Отправляем AI рекомендации отдельным сообщением
+    asyncio.create_task(_send_ai_recommendations(callback.message.chat.id, city))
+    
+    await callback.answer()
+
 # Обработчики состояний FSM
 @dp.message(WeatherSettings.waiting_for_city)
 async def process_city(message: Message, state: FSMContext):
-    """Обработчик ввода города"""
+    """Обработчик ввода города (для настроек или быстрого запроса)"""
     city = message.text.strip()
     user_id = message.from_user.id
     
@@ -353,19 +621,22 @@ async def process_city(message: Message, state: FSMContext):
         await message.answer("❌ Пожалуйста, введите название города:")
         return
     
-    # Обновляем город пользователя
-    db.update_notification_settings(user_id, city=city)
-    
-    # Показываем настройки
+    # Проверяем контекст - это настройка или быстрый запрос
+    # Если пользователь уже есть в БД, это настройка
     user_data = db.get_user(user_id)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏙️ Изменить город", callback_data="change_city")],
-        [InlineKeyboardButton(text="⏰ Настроить время", callback_data="change_time")],
-        [InlineKeyboardButton(text="📊 Тип прогноза", callback_data="change_type")],
-        [InlineKeyboardButton(text="✅ Готово", callback_data="done")]
-    ])
     
-    settings_text = f"""
+    if user_data:
+        # Это настройка города для подписки
+        db.update_notification_settings(user_id, city=city)
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏙️ Изменить город", callback_data="change_city")],
+            [InlineKeyboardButton(text="⏰ Настроить время", callback_data="change_time")],
+            [InlineKeyboardButton(text="📊 Тип прогноза", callback_data="change_type")],
+            [InlineKeyboardButton(text="✅ Готово", callback_data="done")]
+        ])
+        
+        settings_text = f"""
 🌤️ Настройки автоматической отправки погоды
 
 🏙️ Город: {city}
@@ -375,7 +646,46 @@ async def process_city(message: Message, state: FSMContext):
 
 Выберите, что хотите изменить:
 """
-    await message.answer(settings_text, reply_markup=keyboard)
+        await message.answer(settings_text, reply_markup=keyboard)
+    else:
+        # Это быстрый запрос погоды
+        await bot.send_chat_action(message.chat.id, "typing")
+        weather_info = get_weather_json(city)
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Подробный прогноз", callback_data=f"forecast_{city}")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+        ])
+        
+        await message.answer(weather_info, parse_mode="Markdown", reply_markup=keyboard)
+        
+        # Отправляем AI рекомендации отдельным сообщением
+        asyncio.create_task(_send_ai_recommendations(message.chat.id, city))
+    
+    await state.clear()
+
+@dp.message(WeatherSettings.waiting_for_forecast_city)
+async def process_forecast_city(message: Message, state: FSMContext):
+    """Обработчик ввода города для подробного прогноза"""
+    city = message.text.strip()
+    
+    if not city:
+        await message.answer("❌ Пожалуйста, введите название города:")
+        return
+    
+    await bot.send_chat_action(message.chat.id, "typing")
+    weather_info = get_detailed_weather(city)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌤️ Краткий прогноз", callback_data=f"weather_{city}")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+    ])
+    
+    await message.answer(weather_info, parse_mode="Markdown", reply_markup=keyboard)
+    
+    # Отправляем AI рекомендации отдельным сообщением
+    asyncio.create_task(_send_ai_recommendations(message.chat.id, city))
+    
     await state.clear()
 
 @dp.message(WeatherSettings.waiting_for_morning_time)
@@ -453,16 +763,32 @@ async def process_evening_time(message: Message, state: FSMContext):
     await state.clear()
 
 @dp.message(F.text)
-async def handle_text(message: Message):
-    """Обработчик текстовых сообщений (название города)"""
-    city = message.text.strip()
+async def handle_text(message: Message, state: FSMContext):
+    """Обработчик текстовых сообщений"""
+    text = message.text.strip()
+    user_id = message.from_user.id
+    
+    # Проверяем, не находится ли пользователь в состоянии ввода города/времени
+    current_state = await state.get_state()
+    if current_state:
+        # Если пользователь в процессе настройки, пропускаем обработку
+        return
+    
+    # Если это не команда, считаем что это название города
+    city = text
     
     # Показываем, что бот печатает
     await bot.send_chat_action(message.chat.id, "typing")
     
-    # Получаем данные о погоде (используем JSON формат для надежности)
+    # Получаем данные о погоде (краткий прогноз по умолчанию)
     weather_info = get_weather_json(city)
-    await message.answer(weather_info, parse_mode="Markdown")
+    
+    # Добавляем кнопки для подробного прогноза
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Подробный прогноз", callback_data=f"forecast_{city}")]
+    ])
+    
+    await message.answer(weather_info, parse_mode="Markdown", reply_markup=keyboard)
 
 async def main():
     """Основная функция для запуска бота"""
@@ -493,12 +819,5 @@ async def main():
         await bot.session.close()
         print("👋 Бот полностью остановлен")
 
-if __name__ == "__main__":
-    # Проверяем наличие токена
-    if not BOT_TOKEN:
-        print("❌ Ошибка: Не указан токен бота!")
-        print("Пожалуйста, создайте файл .env и укажите BOT_TOKEN=your_token_here")
-        exit(1)
-    
-    # Запускаем бота
-    asyncio.run(main())
+# Примечание: Для запуска бота используйте run_bot.py
+# Этот файл содержит только логику бота и функцию main()
