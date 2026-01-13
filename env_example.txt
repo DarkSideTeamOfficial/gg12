@@ -1,0 +1,12 @@
+# Скопируйте этот файл и переименуйте в .env
+# Затем заполните своими значениями
+
+# Токен Telegram бота (получите у @BotFather)
+BOT_TOKEN=your_bot_token_here
+
+# URL базы данных PostgreSQL
+# Локальная разработка:
+# DATABASE_URL=postgresql://postgres:password@localhost:5432/weather_bot
+# 
+# Или используйте базу данных с Render (External URL для локальной разработки):
+DATABASE_URL=postgresql://username:password@hostname:5432/database_name
